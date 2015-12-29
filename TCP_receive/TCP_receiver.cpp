@@ -98,7 +98,17 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
 		//tcph->th_sport = htons(1000);
 		//tcph->th_dport = htons(1000);
 		tcph->th_seq = htonl(0);
-		tcph->th_ack = htonl(SEQ);
+		
+		if (SEQ >= 8 && SEQ <= 10) // for duplicate ack experiment
+		{
+			tcph->th_ack = htonl(9); // always request packet of SEQ == 9
+		}
+		else
+		{
+			tcph->th_ack = htonl(++SEQ);
+		}
+		
+		//tcph->th_ack = htonl(++SEQ);
 		tcph->th_win = htons(0);
 		tcph->th_flags = TH_ACK;
 

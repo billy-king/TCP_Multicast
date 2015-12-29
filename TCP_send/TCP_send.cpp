@@ -29,10 +29,18 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
+#include <ctime>
+#include <pthread.h>
+#include <iostream>
+#include <iomanip>
+
 #define MAX_PKT_SIZE 1512
 #define DEV "eth0"
 #define IP "192.168.197.142"
 #define TO_IP "192.168.197.150"
+#define guardTime 1000000 // 1s guard time for go-back-n ARQ
+#define timeoutTime 5000000 // 5s for ack timeout
+#define MaxWsize 16 // maximum window size
 
 using namespace std;
 
@@ -41,13 +49,14 @@ struct PKT{
 	int len;
 	u_char packet[MAX_PKT_SIZE];
 	bool isSend;
-	bool isACK;
-	bool isTimeout;
+	//bool isACK;
+	//bool isTimeout;
+	unsigned int receiveACK; // How many ACKs of this PKT has been received.
 };
 
 // libpcap
-pcap_t *outdesc; 					// for send out packet
-char errbuf[PCAP_ERRBUF_SIZE];		// error buffer for libpcap
+pcap_t *outdesc; // for send out packet
+char errbuf[PCAP_ERRBUF_SIZE]; // error buffer for libpcap
 
 // TCP parameters
 vector<struct PKT> CWND;
@@ -56,6 +65,7 @@ long W_size;
 long W_start;
 long W_end;
 
+clock_t timeend; // for timeout; timeend = timestart + timeoutTime
 
 // get the ip header from packet
 struct ip* get_iph(u_char *packet){
@@ -70,6 +80,13 @@ struct tcphdr* get_tcph(u_char *packet){
 	return tcph;
 }
 
+// delay delaytime us
+void delay(int delaytime)
+{
+	clock_t timestop = clock() + delaytime;
+	while(clock() < timestop){}
+}
+
 // print out IP and TCP information of the packet 
 void print_PKT(u_char *packet){
 	static bool isFirst = true;
@@ -81,6 +98,8 @@ void print_PKT(u_char *packet){
 		printf("%-10s", "SEQ #");
 		printf("%-10s", "ACK #");
 		printf("%-10s", "Win Size");
+		printf("%-10s", "Win Start");
+		printf("%-10s", "Win End");
 		printf("\n");
 
 		isFirst = false;
@@ -95,7 +114,10 @@ void print_PKT(u_char *packet){
 	printf("%-10d", ntohs(tcph->th_dport));
 	printf("%-10d", ntohl(tcph->th_seq));
 	printf("%-10d", ntohl(tcph->th_ack));
-	printf("%-10d", ntohs(tcph->th_win));
+	//printf("%-10d", ntohs(tcph->th_win));
+	cout << left << setw(10) << W_size;
+	cout << left << setw(10) << W_start;
+	cout << left << setw(10) << W_end;
 	printf("\n");
 }
 
@@ -120,8 +142,9 @@ vector<struct PKT> reset_PKT_hdr(vector<struct PKT> pkts){
 		inet_aton("0.0.0.0", &iph->ip_dst);
 
 		pkts[i].isSend = false;
-		pkts[i].isACK = false;
-		pkts[i].isTimeout = false;
+		//pkts[i].isACK = false;
+		//pkts[i].isTimeout = false;
+		pkts[i].receiveACK = 0;
 	}
 
 	return pkts;
@@ -138,10 +161,10 @@ vector<struct PKT> get_TCP_PKT(pcap_t *indesc){
 
 		if(pktheader->len > MAX_PKT_SIZE) continue;
 
-		pkt.len = pktheader->len;
+		pkt.len = pktheader->len;		
 		memcpy(pkt.packet, pktdata, pktheader->len);
 
-		// copy 20 packets
+		// copy 5000 packets
 		for(int i = 0;i < 5000;i++){
 			pkts.push_back(pkt);
 		}
@@ -155,12 +178,13 @@ vector<struct PKT> get_TCP_PKT(pcap_t *indesc){
 void init_TCP(){
 	SEQ_NUM = 1;
 	W_size = 1;
-	W_start = 0;
-	W_end = ((W_start + W_size) <= CWND.size()) ? (W_start + W_size) : CWND.size();
+	W_start = 1; // consistent with Seq Num
+	W_end = ((W_start + W_size - 1) <= CWND.size()) ? (W_start + W_size - 1) : CWND.size();	
 }
 
-void send_out(){
-	for(int i = W_start;i < W_end;i++){
+void *send_out(void *arg){
+/*
+	for(int i = W_start;i < W_end;i++){ //i<=W_end is better?
 		struct PKT *pkt = &CWND[i];
 		u_char *packet = pkt->packet;
 		struct ip *iph = get_iph(packet);
@@ -183,15 +207,66 @@ void send_out(){
 
 		print_PKT(packet);
 	}
+*/
+	int i = W_start;
+	while (true)
+	{		
+		if (i >= W_start && i <= W_end)
+		{
+			struct PKT *pkt = &CWND[i];
+			u_char *packet = pkt->packet;
+			struct ip *iph = get_iph(packet);
+			struct tcphdr *tcph = get_tcph(packet);
+
+			// set tcp header
+			tcph->th_sport = htons(1000);
+			tcph->th_dport = htons(1000);
+			tcph->th_seq = htonl(i);
+			tcph->th_ack = htonl(0);
+			tcph->th_win = htons(W_size);
+			tcph->th_flags = 0;
+
+			// set ip header
+			inet_aton(IP, &iph->ip_src);
+			inet_aton(TO_IP, &iph->ip_dst);
+
+			pcap_sendpacket(outdesc, packet, pkt->len);
+
+			if (i == W_start && CWND[i].isSend == false) // the first time sending out the first packet
+			{
+				CWND[i].isSend = true;
+				timeend = clock() + timeoutTime;
+			}
+
+			print_PKT(packet);			
+
+			//delay(1000000);// delay 1s for experiment
+		}
+
+		i++;
+
+		if (i > W_end) // the latest packet number = W_end
+		{
+			delay(guardTime);
+			i = W_start;
+			if ( clock() > timeend && CWND[i].isSend) //timeout
+			{
+				CWND[i].isSend = true;
+				W_size = 1;
+				W_end = ((W_start + W_size - 1) <= CWND.size()) ? (W_start + W_size - 1) : CWND.size();
+			}
+		}
+	}
 }
 
 void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *packet){
-	u_char *pkt = (u_char*)packet;
-	struct ip *iph = get_iph(pkt);
-	struct tcphdr *tcph = get_tcph(pkt);
+	u_char *packettemp = (u_char*)packet;
+	struct ip *iph = get_iph(packettemp);
+	struct tcphdr *tcph = get_tcph(packettemp);
 
 	string ip = string(inet_ntoa(iph->ip_src));
-
+	
+/*
 	// if recieve from 192.168.197.150
 	if(iph->ip_p == IPPROTO_TCP && ip == TO_IP){
 		print_PKT(pkt);
@@ -212,6 +287,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
 				}
 			}
 
+			
 			bool isAllACK = true;
 			for(int i = W_start;i < W_end;i++){
 				struct PKT CW_PKT = CWND[i];
@@ -219,16 +295,50 @@ void got_packet(u_char *args, const struct pcap_pkthdr *header, const u_char *pa
 					isAllACK = false;
 					break;
 				}
-			}
+			}			
 
 			if(isAllACK == true){
 				W_start = W_start + W_size;
 				W_size *= 2;
 				W_end = ((W_start + W_size) <= CWND.size()) ? (W_start + W_size) : CWND.size();
-				send_out();
+				//send_out();
 			}
+			
 		}
-	}
+	}*/
+
+
+	// if recieve from 192.168.197.150
+	if(iph->ip_p == IPPROTO_TCP && ip == TO_IP){
+		print_PKT(packettemp);
+		// if is ack
+		if(tcph->th_flags & TH_ACK)
+		{
+			long ACK = ntohl(tcph->th_ack);
+			ACK--;
+			struct PKT *pkt = &CWND[ACK];
+						
+			if ( (pkt->receiveACK++) == 0 )
+			{	
+				if ( ACK == W_start )
+				{
+					W_start = ACK + 1;					
+					W_size = ((2 * W_size) <= MaxWsize) ? (2 * W_size) : MaxWsize;
+					W_end = ((W_start + W_size - 1) <= CWND.size()) ? (W_start + W_size - 1) : CWND.size();
+				}
+			}
+			else if (pkt->receiveACK >= 3)
+			{
+				cout << "Half CWND" << endl;
+				cout << "packet number " << ACK << " receiveACK " << pkt->receiveACK << endl;
+				pkt->receiveACK = 0;
+				W_size = ((W_size / 2) <= 1) ? 1 : (W_size / 2);
+				//W_size /= 2;
+				W_end = ((W_start + W_size - 1) <= CWND.size()) ? (W_start + W_size - 1) : CWND.size();
+			}			
+		}		
+	//to do: drop the same ack;
+	}	
 }
 
 // main
@@ -254,9 +364,17 @@ int main(int argc, char **argv){
 	}
 
 	// get TCP packets
-	CWND = get_TCP_PKT(indesc);
+	CWND = get_TCP_PKT(indesc);	
 	init_TCP();
-	send_out();
+	pthread_t thread_send;	
+	if ( pthread_create(&thread_send, NULL, &send_out, NULL) )
+	{
+		cout << "Fail to create send thread.\n";
+	}
+	else
+	{
+		cout << "Send thread creation success.\n";
+	}			
 
 	/*for(int i = 0;i < CWND.size();i++)
 		print_PKT(CWND[i].packet);*/
@@ -275,3 +393,16 @@ int main(int argc, char **argv){
 
 	return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
